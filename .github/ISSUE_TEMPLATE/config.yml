@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/DevQwinB/Verity/security/advisories/new
+    about: Contracts, the relay, the sandbox and key handling. Report privately, never in a public issue.
+  - name: Read the docs first
+    url: https://github.com/DevQwinB/Verity/blob/main/README.md
+    about: The README covers setup, the API and the known limits.

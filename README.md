@@ -262,3 +262,10 @@ Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, checks and the PR flow,
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a map of the code, and
+[`SECURITY.md`](SECURITY.md) for reporting a vulnerability. Licensed under
+[Apache-2.0](LICENSE).
