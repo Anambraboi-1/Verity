@@ -26,6 +26,62 @@ fn default_config() -> ConfigRecord {
     }
 }
 
+struct TestSetup {
+    e: Env,
+    token: token::Client<'static>,
+    token_admin: token::StellarAssetClient<'static>,
+    gate: EscrowGateClient<'static>,
+    mkt: ExampleMarketplaceEscrowClient<'static>,
+    mkt_id: Address,
+}
+
+fn setup() -> TestSetup {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(&e, &sac.address());
+    let token_admin = token::StellarAssetClient::new(&e, &sac.address());
+
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
+    let gate = EscrowGateClient::new(&e, &gate_id);
+
+    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
+    mkt.initialize(&admin, &gate_id, &sac.address());
+
+    TestSetup {
+        e,
+        token,
+        token_admin,
+        gate,
+        mkt,
+        mkt_id,
+    }
+}
+
+fn create_escrow_and_submission(
+    setup: &TestSetup,
+    poster: &Address,
+    agent: &Address,
+) -> (u64, u64) {
+    setup.token_admin.mint(poster, &(1000 * XLM));
+    setup.token_admin.mint(agent, &(1000 * XLM));
+
+    let escrow_id = setup.mkt.create_escrow(poster, agent, &(1000 * XLM));
+    let submission_id = setup.gate.submit(
+        agent,
+        &crate::escrow_ref_for(&setup.e, escrow_id),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&setup.e, &[2u8; 32]),
+        &BytesN::from_array(&setup.e, &[3u8; 32]),
+        &(50 * XLM),
+    );
+    (escrow_id, submission_id)
+}
+
 #[test]
 fn release_pays_agent_only_after_gate_verifies() {
     let e = Env::default();
@@ -125,6 +181,77 @@ fn release_refunds_poster_when_gate_slashes() {
     // Bounty returns to the poster, not the agent, on a Slashed verdict.
     assert_eq!(token.balance(&poster), 1000 * XLM);
     assert_eq!(token.balance(&agent), 950 * XLM); // never got the Verity bond back either
+}
+
+#[test]
+fn release_refunds_poster_on_expired_unverified() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+
+    // One re-executor votes mismatch.
+    let rex = Address::generate(&setup.e);
+    setup.token_admin.mint(&rex, &(2000 * XLM));
+    setup.gate.register_reexecutor(&rex, &(600 * XLM));
+    setup.gate.attest_replay(
+        &rex,
+        &submission_id,
+        &BytesN::from_array(&setup.e, &[9u8; 32]),
+        &false,
+    );
+
+    // Window elapses.
+    setup.e.ledger().set_timestamp(setup.e.ledger().timestamp() + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+
+    // Poster gets the full escrow amount back.
+    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
+    // Agent gets only their Verity bond back (950 left after bond + 50 returned).
+    assert_eq!(setup.token.balance(&agent), 1000 * XLM);
+    // Marketplace holds nothing.
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+}
+
+#[test]
+fn initialize_twice_returns_already_initialized() {
+    let setup = setup();
+    let other_admin = Address::generate(&setup.e);
+    let other_gate = Address::generate(&setup.e);
+    let res = setup.mkt.try_initialize(&other_admin, &other_gate, &setup.mkt_id);
+    assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+fn release_unknown_escrow_returns_submission_not_found() {
+    let setup = setup();
+    let res = setup.mkt.try_release(&999u64, &0u64);
+    assert_eq!(res, Err(Ok(Error::SubmissionNotFound)));
+}
+
+#[test]
+fn release_before_window_elapsed_refuses_and_allows_later() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+
+    let agent_balance_before = setup.token.balance(&agent);
+
+    // Early release must fail with ChallengeWindowNotElapsed and move no funds.
+    let res = setup.mkt.try_release(&escrow_id, &submission_id);
+    assert_eq!(res, Err(Ok(Error::ChallengeWindowNotElapsed)));
+    assert_eq!(setup.token.balance(&agent), agent_balance_before);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 1000 * XLM);
+
+    // After the window elapses, release succeeds and pays the payee.
+    setup.e.ledger().set_timestamp(setup.e.ledger().timestamp() + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+    assert_eq!(
+        setup.token.balance(&agent),
+        agent_balance_before + 50 * XLM + 1000 * XLM
+    );
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
 }
 
 #[test]
