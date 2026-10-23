@@ -19,14 +19,17 @@ const MAX_BODY_BYTES = 1_000_000;
 const TIMEOUT_MS = 10_000;
 
 /**
- * The target could not be reached, or answered in a way that says "try
- * again" (5xx, 408, 429). That may be the target, or it may be this host's
- * network — and a vote is irreversible — so the caller retries for a while
- * and then checks its own connectivity before concluding anything.
+ * The target could not be reached (DNS failure including ENOTFOUND, network error),
+ * or answered in a way that says "try again" or is inconclusive (>= 500, 408,
+ * 429, 401, 403, 451). That may be the target, or it may be this host's
+ * resolver, network or IP range — and a vote is irreversible — so the caller
+ * retries for a while and then checks its own connectivity before concluding
+ * anything (after the retry budget a still-failing target is voted as a
+ * mismatch).
  */
 export class RetrievalTransientError extends Error {}
 
-function isPrivateAddress(ip: string): boolean {
+export function isPrivateAddress(ip: string): boolean {
   if (ip.includes(":")) {
     const v6 = ip.toLowerCase();
     return v6 === "::1" || v6 === "::" || v6.startsWith("fc") || v6.startsWith("fd") || v6.startsWith("fe80") || v6.startsWith("::ffff:");
@@ -53,8 +56,12 @@ interface PinnedTarget {
  *
  * Returns the one address that was checked. The request is then made to
  * exactly that address, so the name cannot resolve somewhere else between
- * the check and the connection. */
-async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
+ * the check and the connection.
+ *
+ * allowPrivate skips only the non-public-address refusal, for URLs that come
+ * from the operator's own configuration. It defaults to false so a caller
+ * that forgets it fails closed. */
+export async function resolvePublicTarget(raw: string, opts: { allowPrivate: boolean } = { allowPrivate: false }): Promise<PinnedTarget> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -73,14 +80,14 @@ async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
       addresses = await lookup(host, { all: true });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // The name does not exist: that is an answer. Anything else (timeout,
-      // server failure) is the resolver, not the target.
-      if (code === "ENOTFOUND") throw new Error(`retrieval host ${host} does not exist`);
+      // The resolver on this host can answer NXDOMAIN wrongly (e.g. captive
+      // portal or flaky DNS), and a vote is irreversible: treat failure to resolve
+      // as inconclusive rather than an immediate mismatch.
       throw new RetrievalTransientError(`could not resolve ${host}: ${code ?? (err as Error).message}`);
     }
   }
   if (addresses.length === 0) throw new Error(`retrieval host ${host} has no address`);
-  if (addresses.some((a) => isPrivateAddress(a.address))) {
+  if (!opts.allowPrivate && addresses.some((a) => isPrivateAddress(a.address))) {
     throw new Error(`retrieval target ${host} resolves to a non-public address`);
   }
   // IPv4 first: plenty of hosts have no IPv6 route.
@@ -133,25 +140,52 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
   });
 }
 
-function resolvePointer(doc: unknown, pointer: string): unknown {
+const CANONICAL_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
+
+export function resolvePointer(doc: unknown, pointer: string): unknown {
   if (pointer === "") return doc;
   if (!pointer.startsWith("/")) throw new Error(`invalid JSON pointer: ${pointer}`);
   let node: any = doc;
   for (const raw of pointer.slice(1).split("/")) {
     const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
-    if (node === null || typeof node !== "object" || !(key in node)) {
+    if (node === null || typeof node !== "object") {
       throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
     }
-    node = node[key];
+    if (Array.isArray(node)) {
+      if (!CANONICAL_ARRAY_INDEX.test(key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      const index = Number(key);
+      if (index >= node.length) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[index];
+    } else {
+      if (!Object.hasOwn(node, key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[key];
+    }
   }
   return node;
 }
 
 /**
+ * Returns true if an HTTP status indicates an inconclusive result (e.g. rate limit,
+ * transient server error, or client IP-specific restriction like WAF/geo-block:
+ * 401, 403, 408, 429, 451, or >= 500).
+ */
+export function isInconclusiveStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429 || status === 401 || status === 403 || status === 451;
+}
+
+/**
  * Re-issues the declared request. Throws a plain Error for an outcome that
  * settles the question against the submission (bad spec, private target,
- * redirect, 4xx, oversize, pointer that does not resolve), and a
- * RetrievalTransientError for one that does not.
+ * redirect, definitive 4xx like 404/410, oversize, pointer that does not resolve), and a
+ * RetrievalTransientError for one that is inconclusive (unresolvable host, target
+ * unreachable, >= 500, 408, 429, 401, 403, 451).
+ * After the retry budget a still-failing target is voted as a mismatch.
  */
 export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: string; output: unknown; engine: string }> {
   if (!spec || typeof spec.url !== "string") {
@@ -162,7 +196,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   // A redirect could bounce to a private address, and a moved resource is a
   // legitimate mismatch anyway: the agent declared this URL, not another.
   if (res.status >= 300 && res.status < 400) throw new Error(`retrieval target redirected (HTTP ${res.status})`);
-  if (res.status >= 500 || res.status === 408 || res.status === 429) {
+  if (isInconclusiveStatus(res.status)) {
     throw new RetrievalTransientError(`retrieval target answered HTTP ${res.status}`);
   }
   if (res.status < 200 || res.status >= 300) throw new Error(`retrieval target answered HTTP ${res.status}`);
@@ -177,12 +211,16 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   return { outputHash: canonicalHash(output), output, engine: "http-refetch (public egress only, address pinned)" };
 }
 
-/** True if this host can reach the public internet at all: any HTTP answer
- * from a known-good endpoint counts. Used before blaming a target for being
- * unreachable. */
+/** True if this host can reach its known-good endpoint at all: any HTTP
+ * answer counts. Used before blaming a target for being unreachable.
+ *
+ * controlUrl comes from the operator's own configuration (by default their
+ * Soroban RPC URL, often on localhost or a private network), not from a
+ * submitter, so it may resolve to a private address. That is deliberately
+ * not true of retrieval targets: runRetrieval still refuses them. */
 export async function hasConnectivity(controlUrl: string): Promise<boolean> {
   try {
-    await getPinned(await resolvePublicTarget(controlUrl));
+    await getPinned(await resolvePublicTarget(controlUrl, { allowPrivate: true }));
     return true;
   } catch {
     return false;
