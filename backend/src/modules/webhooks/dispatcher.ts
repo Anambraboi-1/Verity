@@ -70,7 +70,6 @@ export async function deliver(
   payload: unknown
 ): Promise<void> {
   const body = JSON.stringify({ event: eventType, data: payload });
-  const signature = createHmac("sha256", sub.secret).update(body).digest("hex");
   const origin = getUrlOrigin(sub.url);
 
   let deliveryId: string | undefined;
@@ -89,6 +88,13 @@ export async function deliver(
     return;
   }
 
+  // Signed over timestamp, delivery id and body so a captured request cannot be
+  // replayed later or under another delivery id.
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signature = createHmac("sha256", sub.secret)
+    .update(`${timestamp}.${deliveryId}.${body}`)
+    .digest("hex");
+
   try {
     // Re-checked at send time: the host may resolve somewhere else now than
     // it did when the subscription was created. No redirects, for the same reason.
@@ -96,7 +102,12 @@ export async function deliver(
     const res = await fetch(sub.url, {
       method: "POST",
       redirect: "error",
-      headers: { "content-type": "application/json", "x-verity-signature": signature },
+      headers: {
+        "content-type": "application/json",
+        "x-verity-delivery": deliveryId,
+        "x-verity-timestamp": timestamp,
+        "x-verity-signature": signature,
+      },
       body,
       signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
     });
